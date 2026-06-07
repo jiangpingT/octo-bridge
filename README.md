@@ -234,11 +234,18 @@ launchctl print    gui/$U/com.jiang.octo-bridge | grep -E "state|pid ="
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `OCTO_ACCOUNT_ID` | `27xRn3zIJtU442712ef_bot` | 用哪个 octo bot 账号(对应配置里的 key) |
+| `AGENT_BACKEND` | `claude` | 后端选择：`claude`(默认) / `codex`(见 §13) |
 | `CLAUDE_CWD` | `/Users/mlamp/Workspace` | claude 工作目录(决定它读哪个 CLAUDE.md/记忆/技能) |
 | `CLAUDE_BIN` | `/Users/mlamp/.local/bin/claude` | claude 可执行文件 |
 | `CLAUDE_PERMISSION_MODE` | `default` | `default`/`acceptEdits`/`bypassPermissions`/`plan` |
 | `GROUP_ACCESS` | `owner-hint` | 群权限门禁三档(见 §6.5) |
 | `CLAUDE_TIMEOUT_MS` | `180000` | 单次 claude 调用超时 |
+| `CODEX_BIN` | `/opt/homebrew/bin/codex` | codex 可执行文件(仅 codex 后端) |
+| `CODEX_CWD` | `/Users/mlamp/Documents/Codex/2026-05-31/alpha` | codex 工作目录(读该目录 AGENTS.md) |
+| `CODEX_MODEL` | (空=codex 默认) | codex 模型 |
+| `CODEX_TIMEOUT_MS` | `300000` | 单次 codex 调用超时(比 claude 重，给足) |
+| `CODEX_DANGER_FULL_ACCESS` | (未设) | `1` 时 `--dangerously-bypass-approvals-and-sandbox`(全主机权限，高危) |
+| `CODEX_EXTRA_ARGS` | (空) | 追加给 codex exec 的额外参数(空格分隔) |
 
 ---
 
@@ -274,8 +281,35 @@ launchctl print    gui/$U/com.jiang.octo-bridge | grep -E "state|pid ="
 
 ---
 
+## 13. Codex Harness 后端(多后端支持)
+
+瘦桥支持两种本体后端，由 `AGENT_BACKEND` 切换，默认 `claude`(对现有 jpclaude 零影响)。
+
+### 13.1 机制
+- `runAgent()` 按 `AGENT_BACKEND` 分发到 `runClaude()` 或 `runCodex()`。
+- codex 后端 spawn 本机 `codex exec`(cwd=`CODEX_CWD`，读该目录 `AGENTS.md` 作人格)，复用同一套悟空IM 收发、串行队列、断线补拉、群权限门禁。
+- **回复**从 `-o <tmp>` 文件读(干净的最终消息)；**session id** 从 `--json` 的 JSONL 事件流容错抠取(兼容 `session_id`/`conversation_id`/`thread_id` 字段漂移)。
+- **prompt 走 stdin**(`-`)，避免 argv 转义/长度问题，天然防注入。
+
+### 13.2 会话续接(关键差异)
+- claude 用确定性 UUID 直接 `--session-id`/`--resume`；codex 不支持自定义 session-id 新建，只能 `codex exec resume <id>` 续接已有会话。
+- 故瘦桥维护 `.codex-sessions.json`(`octo:<account>:<sessionKey>` → `codexSessionId`)，新建会话后从 JSONL 抠出 id 落盘，下条消息走 resume，跨重启续接。
+- **resume 不接受 `-C/--cd` 和 `--sandbox`**(沿用原会话的 cwd/sandbox)，续接时只能用 `--dangerously-bypass-approvals-and-sandbox` 覆盖权限；新建会话才能设 `-C`/`--sandbox`。
+
+### 13.3 安全
+- `CODEX_DANGER_FULL_ACCESS=1` 等价于 claude 的 `bypassPermissions`：任何能私聊该 bot 的人都能全权操作本机。群面由 `GROUP_ACCESS` 锁死(默认只听 owner)，danger 模式建议把该实例的 `GROUP_ACCESS` 收紧到 `owner`(静默)。
+- 不设 `CODEX_DANGER_FULL_ACCESS` 时新建会话用 `--sandbox workspace-write`(受限)。
+
+### 13.4 部署：一个账号一个进程
+jpclaude 与 jpcodex 是两个账号，**不能同进程共用**。codex 后端通过**第二个 LaunchAgent**(如 `com.jiang.octo-bridge-codex`)承载，env 设 `OCTO_ACCOUNT_ID=<jpcodex账号>` + `AGENT_BACKEND=codex`，**不动现有 jpclaude 的 agent**。
+
+> ⚠️ 前置：起 codex 桥前必须先在 OpenClaw 里把该账号 `enabled:false` 并重启网关，释放 WS 独占——否则与网关双连接互踢 `Kicked by server`(同 §10)。
+
+---
+
 ## 文件清单
 
-- `bridge.mjs` —— 全部逻辑(单文件，~300 行)。
-- `.gitignore` —— 屏蔽 `bridge.log` 等(含聊天内容，不入库)。
-- 部署用的 `com.jiang.octo-bridge.plist` 属机器本地配置，不在仓库内(含本机绝对路径)。
+- `bridge.mjs` —— 全部逻辑(单文件，支持 claude / codex 双后端)。
+- `.gitignore` —— 屏蔽 `bridge.log`、`.codex-sessions.json` 等(含聊天内容/会话映射，不入库)。
+- `.codex-sessions.json` —— codex 会话映射(运行时生成，本机文件，不入库)。
+- 部署用的 `com.jiang.octo-bridge*.plist` 属机器本地配置，不在仓库内(含本机绝对路径)。

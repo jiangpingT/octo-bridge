@@ -4,9 +4,10 @@
 // 一头：把收到的私聊消息交给本机 claude CLI（cwd=Workspace，读 CLAUDE.md / 记忆 / 技能）
 // token 不硬编码——运行时从 ~/.openclaw/openclaw.json 读取。
 
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 
@@ -26,6 +27,25 @@ const PERMISSION_MODE = process.env.CLAUDE_PERMISSION_MODE || "default";
 //   all            — 群里任何人 @ 都能使唤（危险：等于把命令执行权开放给全体群成员）
 const GROUP_ACCESS = process.env.GROUP_ACCESS || "owner-hint";
 const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 180000);
+
+// ---- 后端选择 ----
+//   claude（默认）— spawn 本机 claude CLI（cwd=Workspace，本体阿策）
+//   codex          — spawn 本机 codex CLI（cwd=CODEX_CWD，Codex harness 本体）
+const AGENT_BACKEND = process.env.AGENT_BACKEND || "claude";
+
+// ---- Codex 后端配置（仅 AGENT_BACKEND=codex 时使用）----
+const CODEX_BIN = process.env.CODEX_BIN || "/opt/homebrew/bin/codex";
+const CODEX_CWD = process.env.CODEX_CWD || "/Users/mlamp/Documents/Codex/2026-05-31/alpha";
+const CODEX_MODEL = process.env.CODEX_MODEL || "";          // 空 = 用 codex 默认模型
+const CODEX_TIMEOUT_MS = Number(process.env.CODEX_TIMEOUT_MS || 300000);
+const CODEX_DANGER_FULL_ACCESS = process.env.CODEX_DANGER_FULL_ACCESS === "1";
+const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || "").trim()
+  ? process.env.CODEX_EXTRA_ARGS.trim().split(/\s+/)
+  : [];
+// codex 会话映射文件：放在桥自己的目录里（已被 .gitignore 屏蔽，不入库）
+const BRIDGE_DIR = dirname(fileURLToPath(import.meta.url));
+const CODEX_SESSIONS_FILE = join(BRIDGE_DIR, ".codex-sessions.json");
+
 const APPEND_SYSTEM_DM =
   "你正在通过 Octo IM 和姜哥私聊。直接用中文口语化回复，简洁，不要用 markdown 标题或大段列表。";
 const APPEND_SYSTEM_GROUP =
@@ -96,9 +116,105 @@ function runClaude(sessionKey, text, appendSystem) {
   })();
 }
 
+// ---- Codex 后端 ----
+// 会话映射：octo:<account>:<sessionKey> -> { codexSessionId, updatedAt }，持久化到磁盘，跨重启续接
+function loadCodexSessions() {
+  try { return JSON.parse(readFileSync(CODEX_SESSIONS_FILE, "utf8")); }
+  catch { return {}; }
+}
+let codexSessions = loadCodexSessions();
+function saveCodexSessions() {
+  try { writeFileSync(CODEX_SESSIONS_FILE, JSON.stringify(codexSessions, null, 2)); }
+  catch (e) { log("保存 codex 会话映射失败:", e?.message || e); }
+}
+
+// 从 codex --json 的 JSONL 事件流里容错地抠出 session id（兼容字段名漂移：session/conversation/thread）
+function extractCodexSessionId(jsonl) {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const findId = (o) => {
+    if (!o || typeof o !== "object") return null;
+    for (const [k, v] of Object.entries(o)) {
+      if (typeof v === "string" && /session|conversation|thread/i.test(k) && uuid.test(v)) return v;
+      if (v && typeof v === "object") { const r = findId(v); if (r) return r; }
+    }
+    return null;
+  };
+  for (const line of String(jsonl).split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    try { const id = findId(JSON.parse(s)); if (id) return id; } catch {}
+  }
+  return null;
+}
+
+function runCodex(sessionKey, text, appendSystem) {
+  const mapKey = `octo:${ACCOUNT_ID}:${sessionKey}`;
+  // codex 没有 --append-system-prompt，把场景说明折叠进 prompt
+  const prompt = `${appendSystem}\n\n当前用户消息：\n${text}`;
+  const modelArgs = CODEX_MODEL ? ["--model", CODEX_MODEL] : [];
+
+  // 一次 codex exec 调用；prompt 走 stdin（避免 argv 转义/长度问题）；回复从 -o 文件读，session id 从 --json 流抠
+  const runOnce = (sessionArgs) =>
+    new Promise((resolve) => {
+      const tmp = join(tmpdir(), `codex-out-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+      const args = ["exec", ...sessionArgs, "--json", "--skip-git-repo-check",
+        ...modelArgs, ...CODEX_EXTRA_ARGS, "-o", tmp, "-"];
+      const child = spawn(CODEX_BIN, args, { cwd: CODEX_CWD, env: process.env });
+      let stdout = "", err = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, CODEX_TIMEOUT_MS);
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (err += d));
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        let out = "";
+        try { out = readFileSync(tmp, "utf8").trim(); } catch {}
+        try { unlinkSync(tmp); } catch {}
+        resolve({ code, out, err: err.trim(), sid: extractCodexSessionId(stdout) });
+      });
+      child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out: "", err: String(e), sid: null }); });
+      try { child.stdin.write(prompt); child.stdin.end(); } catch {}
+    });
+
+  return (async () => {
+    const existing = codexSessions[mapKey]?.codexSessionId;
+    const dangerFlag = CODEX_DANGER_FULL_ACCESS ? ["--dangerously-bypass-approvals-and-sandbox"] : [];
+
+    // 续接：resume 不接受 -C/--sandbox（沿用原会话的 cwd/sandbox），只能用 danger 开关
+    if (existing) {
+      const r = await runOnce(["resume", existing, ...dangerFlag]);
+      if (r.code === 0 && r.out) {
+        if (r.sid) { codexSessions[mapKey] = { codexSessionId: r.sid, updatedAt: new Date().toISOString() }; saveCodexSessions(); }
+        return r;
+      }
+      log(`codex resume 失败(code=${r.code} err=${r.err.slice(0, 160)})，回退新建会话`);
+    }
+
+    // 新建：可设 -C / --sandbox
+    const sandbox = CODEX_DANGER_FULL_ACCESS
+      ? ["--dangerously-bypass-approvals-and-sandbox"]
+      : ["--sandbox", "workspace-write"];
+    const r = await runOnce(["-C", CODEX_CWD, ...sandbox]);
+    if (r.code === 0 && r.sid) {
+      codexSessions[mapKey] = { codexSessionId: r.sid, updatedAt: new Date().toISOString() };
+      saveCodexSessions();
+    }
+    return r;
+  })();
+}
+
+// 统一入口：按 AGENT_BACKEND 分发
+function runAgent(sessionKey, text, appendSystem) {
+  if (AGENT_BACKEND === "codex") return runCodex(sessionKey, text, appendSystem);
+  return runClaude(sessionKey, text, appendSystem);
+}
+
 async function main() {
   const { botToken, apiUrl } = loadCreds();
-  log(`瘦桥启动 account=${ACCOUNT_ID} api=${apiUrl} cwd=${WORKSPACE} perm=${PERMISSION_MODE}`);
+  if (AGENT_BACKEND === "codex") {
+    log(`瘦桥启动 backend=codex account=${ACCOUNT_ID} api=${apiUrl} codex_cwd=${CODEX_CWD} model=${CODEX_MODEL || "(default)"} danger=${CODEX_DANGER_FULL_ACCESS}`);
+  } else {
+    log(`瘦桥启动 backend=claude account=${ACCOUNT_ID} api=${apiUrl} cwd=${WORKSPACE} perm=${PERMISSION_MODE}`);
+  }
 
   // 注册带重试：启动时若撞网络抖动（fetch failed）不直接崩，退避重试
   const creds = await (async () => {
@@ -197,7 +313,7 @@ async function main() {
         sendReadReceipt({ apiUrl, botToken, channelId, channelType,
           messageIds: msg.message_id ? [msg.message_id] : [] }).catch(() => {});
         sendTyping({ apiUrl, botToken, channelId, channelType }).catch(() => {});
-        const r = await runClaude(sessionKey, text, appendSystem);
+        const r = await runAgent(sessionKey, text, appendSystem);
         let reply = r.out;
         if (!reply) {
           log(`claude 无输出 code=${r.code} err=${r.err.slice(0, 200)}`);
