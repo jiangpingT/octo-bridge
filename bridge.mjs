@@ -74,8 +74,6 @@ function sessionUuid(key) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-const seenPeers = new Set();
-
 function runClaude(sessionKey, text, appendSystem) {
   const sid = sessionUuid(sessionKey);
   const base = ["-p", "--output-format", "text", "--permission-mode", PERMISSION_MODE,
@@ -101,18 +99,17 @@ function runClaude(sessionKey, text, appendSystem) {
       });
     });
 
-  // 先尝试续接已有会话；没有则新建。跨重启也稳。
+  // 优先续接（session 由确定性 UUID 持久化在磁盘，跨重启也在）；续接不出内容再新建。
   return (async () => {
-    if (seenPeers.has(sid)) {
-      const r = await tryRun(["--resume", sid]);
-      if (r.code === 0 && r.out) return r;
+    const r = await tryRun(["--resume", sid]);
+    if (r.code === 0 && r.out) return r;
+    const created = await tryRun(["--session-id", sid]);
+    if (created.code === 0 && created.out) return created;
+    // 新建撞 "already in use"：session 其实存在（上次超时残留锁/偶发失败），再试一次续接
+    if (/already in use/i.test(created.err || "")) {
+      return await tryRun(["--resume", sid]);
     }
-    let r = await tryRun(["--resume", sid]);
-    if (r.code !== 0 || !r.out) {
-      r = await tryRun(["--session-id", sid]);
-    }
-    if (r.code === 0) seenPeers.add(sid);
-    return r;
+    return created;
   })();
 }
 
