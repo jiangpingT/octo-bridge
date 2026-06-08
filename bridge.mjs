@@ -87,49 +87,51 @@ function log(...a) {
   console.log(new Date().toISOString(), ...a);
 }
 
-// 会话 key（私聊=对端 uid，群聊=群 channel_id）-> 稳定 UUID（给 claude --session-id 用，做续接）
+// 会话 key（私聊=对端 uid，群聊=群 channel_id）-> 稳定 UUID（buddy 后端 --session-id 续接用）
 function sessionUuid(key) {
   const h = createHash("md5").update(`octo:${ACCOUNT_ID}:${key}`).digest("hex");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-function runClaude(sessionKey, text, appendSystem) {
-  const sid = sessionUuid(sessionKey);
-  const base = ["-p", "--output-format", "text", "--permission-mode", PERMISSION_MODE,
-    "--append-system-prompt", appendSystem];
-  const tryRun = (sessionArgs) =>
-    new Promise((resolve) => {
-      const args = [...base, ...sessionArgs, text];
-      const child = spawn(CLAUDE_BIN, args, {
-        cwd: WORKSPACE,
-        env: process.env,
-      });
-      let out = "", err = "";
-      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, CLAUDE_TIMEOUT_MS);
-      child.stdout.on("data", (d) => (out += d));
-      child.stderr.on("data", (d) => (err += d));
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ code, out: out.trim(), err: err.trim() });
-      });
-      child.on("error", (e) => {
-        clearTimeout(timer);
-        resolve({ code: -1, out: "", err: String(e) });
-      });
-    });
+// claude 2.1.168 的 headless `--resume`/`--session-id 续接` 会挂死（无输出直到被超时杀掉，
+// 在任意 cwd、清空 stdin、全新 session 下都复现，是 CLI 这一版的 bug），所以瘦桥不再用磁盘
+// session 续接。改为：每次全新会话 + 自己在内存里维护每个会话最近几轮对话，折叠进 prompt，
+// 既保证短期上下文连续，又避开 --resume 挂死。长期记忆仍由 cwd 的 CLAUDE.md/记忆系统兜底。
+const CLAUDE_HISTORY_TURNS = 6; // 每会话保留最近 6 轮（user+assistant）
+const claudeHistory = new Map(); // sessionKey -> [{ role:"user"|"assistant", text }]
 
-  // 优先续接（session 由确定性 UUID 持久化在磁盘，跨重启也在）；续接不出内容再新建。
-  return (async () => {
-    const r = await tryRun(["--resume", sid]);
-    if (r.code === 0 && r.out) return r;
-    const created = await tryRun(["--session-id", sid]);
-    if (created.code === 0 && created.out) return created;
-    // 新建撞 "already in use"：session 其实存在（上次超时残留锁/偶发失败），再试一次续接
-    if (/already in use/i.test(created.err || "")) {
-      return await tryRun(["--resume", sid]);
-    }
-    return created;
-  })();
+function runClaude(sessionKey, text, appendSystem) {
+  const hist = claudeHistory.get(sessionKey) || [];
+  const transcript = hist.length
+    ? "最近对话（按时间顺序，便于你延续上下文）：\n" +
+      hist.map((h) => `${h.role === "user" ? "对方" : "你"}：${h.text}`).join("\n") + "\n\n"
+    : "";
+  const prompt = `${transcript}当前对方消息：\n${text}`;
+  const args = ["-p", "--output-format", "text", "--permission-mode", PERMISSION_MODE,
+    // 禁用所有 MCP：cwd=Workspace 会继承全套 .mcp.json(playwright/context7 等)，
+    // 每次 -p 冷启动这些重型 server 要几十秒~数分钟，IM 群聊场景用不到，禁掉换秒级响应。
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--append-system-prompt", appendSystem];
+  return new Promise((resolve) => {
+    // prompt 走 stdin（避免 argv 转义/长度问题，并立即 end 防 claude 等 3s stdin）
+    const child = spawn(CLAUDE_BIN, args, { cwd: WORKSPACE, env: process.env });
+    let out = "", err = "";
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, CLAUDE_TIMEOUT_MS);
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const o = out.trim();
+      if (code === 0 && o) {
+        const next = [...hist, { role: "user", text }, { role: "assistant", text: o }]
+          .slice(-CLAUDE_HISTORY_TURNS * 2);
+        claudeHistory.set(sessionKey, next);
+      }
+      resolve({ code, out: o, err: err.trim() });
+    });
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out: "", err: String(e) }); });
+    try { child.stdin.write(prompt); child.stdin.end(); } catch {}
+  });
 }
 
 // ---- Codex 后端 ----
