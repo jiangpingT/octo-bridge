@@ -4,17 +4,18 @@
 // 一头：把收到的私聊消息交给本机 claude CLI（cwd=Workspace，读 CLAUDE.md / 记忆 / 技能）
 // token 不硬编码——运行时从 ~/.openclaw/openclaw.json 读取。
 
-import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const OCTO_DIST = "/Users/mlamp/.openclaw/extensions/octo/dist/src";
 const { WKSocket } = await import(join(OCTO_DIST, "socket.js"));
 const { registerBot, sendMessage, sendTyping, sendHeartbeat, sendReadReceipt, postJson } =
   await import(join(OCTO_DIST, "api-fetch.js"));
+const { uploadAndSendMedia } = await import(join(OCTO_DIST, "inbound.js"));
 
 // ---- 配置 ----
 const ACCOUNT_ID = process.env.OCTO_ACCOUNT_ID || "27xRn3zIJtU442712ef_bot";
@@ -65,11 +66,35 @@ const BUDDY_PERMISSION_MODE = process.env.BUDDY_PERMISSION_MODE || "bypassPermis
 const BUDDY_MODEL = process.env.BUDDY_MODEL || "auto";   // 空 = 不传 --model
 const BUDDY_TIMEOUT_MS = Number(process.env.BUDDY_TIMEOUT_MS || 300000);
 
+// ---- 视觉回声（任务胶囊）配置 ----
+//   VISUAL_ECHO=on（默认）解析 <!-- mission-capsule --> 块、生成 artifact、私聊 owner 异步发图
+//   VISUAL_ECHO=off 整套视觉旁路彻底关闭（主回复行为与改动前完全一致，便于验收对照/回退）
+const VISUAL_ECHO = (process.env.VISUAL_ECHO || "on").toLowerCase();
+const VISUAL_RUNS_DIR = process.env.VISUAL_RUNS_DIR || join(BRIDGE_DIR, "runs");
+// artifact 目录里的 <agent> 段：默认用后端名，plist 可覆盖成 jpcodex/jpclaude 等
+const VISUAL_AGENT = process.env.VISUAL_AGENT || AGENT_BACKEND;
+
+// 任务胶囊输出约定：VISUAL_ECHO=on 时折进每个后端的 appendSystem，让本体在实际任务后
+// 自动追加一个结构化块，由 bridge 解析渲染成视觉卡。只在 IM 场景生效，不污染终端直跑的本体。
+const CAPSULE_INSTRUCTION =
+  "【任务胶囊】当你完成的是一个有过程的实际任务（涉及读取/执行/修改/验证等步骤）时，" +
+  "在回复正文最后追加且仅追加一个 HTML 注释块：<!-- mission-capsule {JSON} -->。" +
+  "JSON 字段：title(任务标题)、status、statusLabel(中文：已完成/进行中/部分完成/失败)、" +
+  "stages(固定四阶段数组，每项含 name(scout/forge/prove/report)、label(探查/执行/验证/汇报)、" +
+  "state(done/running/pending/failed)、stateLabel(中文)、summary(一句话)、可选 why)、" +
+  "result(结果摘要)、correctness(0~1 小数或 null)、correctnessLabel(高/中/低/未验证)、" +
+  "correctnessBasis(正确率依据)、why(为什么这么做/这么判断，必填)、可选 evidence(证据数组)。" +
+  "规则：correctness 必须有据、绝不编造，没有验证手段就填 null + 未验证；注释块只发一个、放最末尾；" +
+  "纯闲聊或简单问答不要加这个块；块内绝不能出现 token、密钥、Authorization、cookie 等敏感信息。";
+const CAPSULE_SUFFIX = VISUAL_ECHO === "on" ? "\n\n" + CAPSULE_INSTRUCTION : "";
+
 const APPEND_SYSTEM_DM =
-  "你正在通过 Octo IM 和姜哥私聊。直接用中文口语化回复，简洁，不要用 markdown 标题或大段列表。";
+  "你正在通过 Octo IM 和姜哥私聊。直接用中文口语化回复，简洁，不要用 markdown 标题或大段列表。" +
+  CAPSULE_SUFFIX;
 const APPEND_SYSTEM_GROUP =
   "你正在通过 Octo IM 的群聊里和姜哥对话（群里还有其他人，但只有姜哥能使唤你）。" +
-  "回复要更简短聚焦，只答被问到的，别刷屏，别用 markdown 标题或大段列表。";
+  "回复要更简短聚焦，只答被问到的，别刷屏，别用 markdown 标题或大段列表。" +
+  CAPSULE_SUFFIX;
 // 别人在群里 @ 机器人时的固定礼貌回复（不跑 claude、不执行任何指令）
 const GROUP_NON_OWNER_REPLY = "你好，群里我只回应我的主人。有事可以私聊我～";
 
@@ -285,6 +310,239 @@ function runAgent(sessionKey, text, appendSystem) {
   return runClaude(sessionKey, text, appendSystem);
 }
 
+// ========== 视觉回声（任务胶囊）==========
+// resvg 仅在真正渲染 PNG 时才动态加载，避免 VISUAL_ECHO=off 时引入依赖。
+let _Resvg = null;
+async function getResvg() {
+  if (_Resvg === null) {
+    const mod = await import("@resvg/resvg-js");
+    _Resvg = mod.Resvg;
+  }
+  return _Resvg;
+}
+
+// 解析 Agent 文本里的 <!-- mission-capsule {json} --> 块。
+// 只取第一个、非贪婪；解析失败一律降级（返回原文 + capsule:null），绝不影响主回复。
+function parseMissionCapsule(text) {
+  const src = String(text ?? "");
+  const m = src.match(/<!--\s*mission-capsule\s*([\s\S]*?)-->/);
+  if (!m) return { displayText: src, capsule: null };
+  let capsule = null;
+  try {
+    capsule = JSON.parse(m[1].trim());
+  } catch {
+    return { displayText: src, capsule: null }; // JSON 坏：原文照发，不生成卡
+  }
+  const displayText = (src.slice(0, m.index) + src.slice(m.index + m[0].length)).trim();
+  return { displayText, capsule };
+}
+
+// 敏感信息过滤：按已知前缀/上下文精确替换，不用 {32,} 通配（避免误杀 hash/id）。
+// 发图=上传公网 CDN，渲染进图/写进 artifact 的每个字段都必须先过这一关。
+function redactSecrets(input) {
+  let s = String(input ?? "");
+  s = s.replace(/bf_[A-Za-z0-9_-]+/g, "bf_REDACTED");
+  s = s.replace(/sk-[A-Za-z0-9_-]+/g, "sk_REDACTED");
+  s = s.replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, "Bearer REDACTED");
+  s = s.replace(/(authorization)\s*:\s*\S+/gi, "$1: REDACTED");
+  s = s.replace(/([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD))\s*[=:]\s*\S+/g, "$1=REDACTED");
+  s = s.replace(/(cookie)\s*[:=]\s*\S+/gi, "$1=REDACTED");
+  return s;
+}
+
+function xmlEscape(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+// 同时过滤敏感信息 + XML 转义（所有进 SVG 的文本必走）
+function safe(s) {
+  return xmlEscape(redactSecrets(s));
+}
+
+// 按显示宽度折行：CJK 记 1 单位、ASCII 记 0.5；尊重原文 \n。
+function wrapText(text, maxUnits) {
+  const out = [];
+  for (const rawLine of String(text ?? "").split("\n")) {
+    let cur = "", units = 0;
+    for (const ch of rawLine) {
+      const w = /[\x00-\xff]/.test(ch) ? 0.5 : 1;
+      if (units + w > maxUnits && cur) { out.push(cur); cur = ""; units = 0; }
+      cur += ch; units += w;
+    }
+    out.push(cur);
+  }
+  return out.length ? out : [""];
+}
+
+const STATE_COLOR = {
+  done: "#34d399", completed: "#34d399",
+  running: "#60a5fa",
+  pending: "#9ca3af", queued: "#9ca3af",
+  failed: "#f87171", blocked: "#f87171",
+  "needs-confirmation": "#fbbf24", partial: "#fbbf24",
+};
+function correctnessColor(label) {
+  if (label === "高") return "#34d399";
+  if (label === "中") return "#fbbf24";
+  if (label === "低") return "#f87171";
+  return "#9ca3af";
+}
+
+// 生成酷炫结果卡 SVG（深色底 + 渐变 + 圆角 + 阶段进度）。
+// 所有填入字段先过 safe()（过滤 + 转义）。
+function buildCapsuleSvg(capsule, shortId) {
+  const W = 1080, PAD = 64, X = PAD, CW = W - PAD * 2;
+  const parts = [];
+  let y = 96;
+
+  // 标题
+  for (const line of wrapText(capsule.title || "任务胶囊", 24)) {
+    parts.push(`<text x="${X}" y="${y}" fill="#f8fafc" font-size="46" font-weight="700">${safe(line)}</text>`);
+    y += 60;
+  }
+  // 状态徽标
+  const statusLabel = capsule.statusLabel || capsule.status || "";
+  if (statusLabel) {
+    parts.push(`<text x="${X}" y="${y}" fill="#a5b4fc" font-size="28" font-weight="600">● ${safe(statusLabel)}</text>`);
+    y += 28;
+  }
+  y += 24;
+  parts.push(`<line x1="${X}" y1="${y}" x2="${X + CW}" y2="${y}" stroke="#334155" stroke-width="2"/>`);
+  y += 52;
+
+  // 四阶段进度
+  const stages = Array.isArray(capsule.stages) ? capsule.stages : [];
+  for (const st of stages) {
+    const color = STATE_COLOR[st.state] || "#9ca3af";
+    const head = `${st.label || st.name || ""}　${st.stateLabel || st.state || ""}`;
+    parts.push(`<circle cx="${X + 10}" cy="${y - 10}" r="11" fill="${color}"/>`);
+    parts.push(`<text x="${X + 38}" y="${y}" fill="#e2e8f0" font-size="30" font-weight="600">${safe(head)}</text>`);
+    y += 38;
+    if (st.summary) {
+      for (const line of wrapText(st.summary, 40)) {
+        parts.push(`<text x="${X + 38}" y="${y}" fill="#94a3b8" font-size="25">${safe(line)}</text>`);
+        y += 34;
+      }
+    }
+    y += 14;
+  }
+
+  y += 18;
+  parts.push(`<line x1="${X}" y1="${y}" x2="${X + CW}" y2="${y}" stroke="#334155" stroke-width="2"/>`);
+  y += 52;
+
+  // 字段块通用绘制
+  const block = (label, value, valueColor = "#e2e8f0") => {
+    if (value == null || value === "") return;
+    parts.push(`<text x="${X}" y="${y}" fill="#64748b" font-size="24" font-weight="600">${safe(label)}</text>`);
+    y += 38;
+    for (const line of wrapText(value, 42)) {
+      parts.push(`<text x="${X}" y="${y}" fill="${valueColor}" font-size="28">${safe(line)}</text>`);
+      y += 40;
+    }
+    y += 18;
+  };
+
+  block("结果", capsule.result);
+  const corrLabel = capsule.correctnessLabel || "未验证";
+  const corrText = capsule.correctnessBasis
+    ? `${corrLabel}（${capsule.correctnessBasis}）` : corrLabel;
+  block("正确率", corrText, correctnessColor(corrLabel));
+  block("为什么", capsule.why);
+  if (capsule.evidence != null && capsule.evidence !== "") {
+    const ev = Array.isArray(capsule.evidence) ? capsule.evidence.join("，") : capsule.evidence;
+    block("证据", ev, "#cbd5e1");
+  }
+
+  // 页脚：短 id + agent
+  y += 8;
+  parts.push(`<text x="${X}" y="${y}" fill="#475569" font-size="22">${safe(VISUAL_AGENT)} · ${safe(shortId)}</text>`);
+  y += 40;
+
+  const H = y + PAD - 24;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="PingFang SC, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#1e1b4b"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="${W}" height="${H}" rx="36" fill="url(#bg)"/>
+  <rect x="6" y="6" width="${W - 12}" height="${H - 12}" rx="32" fill="none" stroke="#3730a3" stroke-width="2" opacity="0.5"/>
+  ${parts.join("\n  ")}
+</svg>`;
+}
+
+async function renderPng(svg) {
+  const Resvg = await getResvg();
+  const r = new Resvg(svg, { fitTo: { mode: "width", value: 1080 } });
+  return r.render().asPng();
+}
+
+// 人类可读复盘（已过滤），写 summary.md
+function buildSummaryMd(capsule) {
+  const lines = [];
+  lines.push(`# ${redactSecrets(capsule.title || "任务胶囊")}`);
+  lines.push("");
+  if (capsule.statusLabel || capsule.status) lines.push(`状态：${redactSecrets(capsule.statusLabel || capsule.status)}`);
+  if (capsule.result) lines.push(`结果：${redactSecrets(capsule.result)}`);
+  const corr = capsule.correctnessLabel || "未验证";
+  lines.push(`正确率：${redactSecrets(corr)}${capsule.correctnessBasis ? `（${redactSecrets(capsule.correctnessBasis)}）` : ""}`);
+  if (capsule.why) lines.push(`为什么：${redactSecrets(capsule.why)}`);
+  lines.push("");
+  lines.push("## 阶段");
+  for (const st of (Array.isArray(capsule.stages) ? capsule.stages : [])) {
+    lines.push(`- ${redactSecrets(st.label || st.name || "")} ${redactSecrets(st.stateLabel || st.state || "")}` +
+      (st.summary ? `：${redactSecrets(st.summary)}` : "") +
+      (st.why ? `（为什么：${redactSecrets(st.why)}）` : ""));
+  }
+  return lines.join("\n") + "\n";
+}
+
+// 视觉副通道主体：fire-and-forget。全程 try/catch，任何失败只 log，绝不抛、绝不影响主回复。
+async function runVisualEcho({ capsule, isDM, isOwner, channelId, channelType, apiUrl, botToken }) {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const shortId = randomBytes(2).toString("hex");
+    const dir = join(VISUAL_RUNS_DIR, VISUAL_AGENT, `${ts}-${shortId}`);
+    mkdirSync(dir, { recursive: true });
+
+    // run.json：结构化任务胶囊（含 correctness/why），写盘前过滤敏感串
+    const runObj = JSON.parse(redactSecrets(JSON.stringify({
+      id: `${ts}-${shortId}`, agent: VISUAL_AGENT, backend: AGENT_BACKEND, ...capsule,
+    })));
+    writeFileSync(join(dir, "run.json"), JSON.stringify(runObj, null, 2));
+    writeFileSync(join(dir, "summary.md"), buildSummaryMd(capsule));
+
+    // SVG 本地存档；PNG 才是发进 IM 的（SVG 无宽高，客户端渲染异常）
+    const svg = buildCapsuleSvg(capsule, shortId);
+    writeFileSync(join(dir, "capsule.svg"), svg);
+
+    let pngPath = null;
+    try {
+      const png = await renderPng(svg);
+      pngPath = join(dir, "capsule.png");
+      writeFileSync(pngPath, png);
+    } catch (e) {
+      log(`视觉卡 PNG 渲染失败（已留 run.json/svg）: ${e?.message || e}`);
+    }
+
+    // 只有私聊 owner 才发图：图会上公网 CDN，群聊/非 owner 永不发
+    if (pngPath && isDM && isOwner) {
+      await uploadAndSendMedia({
+        mediaUrl: pngPath, apiUrl, botToken, channelId, channelType, log,
+      });
+      log(`visual card sent (${VISUAL_AGENT}/${ts}-${shortId})`);
+    } else {
+      log(`visual card 已生成未发图 dm=${isDM} owner=${isOwner} (${VISUAL_AGENT}/${ts}-${shortId})`);
+    }
+  } catch (e) {
+    log("runVisualEcho 失败（仅记录，不影响主回复）:", e?.message || e);
+  }
+}
+
 async function main() {
   const { botToken, apiUrl } = loadCreds();
   if (AGENT_BACKEND === "codex") {
@@ -400,8 +658,21 @@ async function main() {
           log(`claude 无输出 code=${r.code} err=${r.err.slice(0, 200)}`);
           reply = "（抱歉姜哥，我这边没生成出回复，稍后再试一次）";
         }
-        await sendMessage({ apiUrl, botToken, channelId, channelType, content: reply });
-        log(`已回复 (${reply.length} 字)`);
+        // 解析任务胶囊：主回复发的是剥掉 <!-- mission-capsule --> 块的正文
+        const { displayText, capsule } = VISUAL_ECHO === "on"
+          ? parseMissionCapsule(reply)
+          : { displayText: reply, capsule: null };
+        const sendText = displayText || reply;
+        await sendMessage({ apiUrl, botToken, channelId, channelType, content: sendText });
+        log(`已回复 (${sendText.length} 字)`);
+        // 视觉副通道：fire-and-forget，绝不 await、绝不影响主回复速度
+        if (VISUAL_ECHO === "on" && capsule) {
+          const isOwner = isDM ? !!(ownerUid && msg.from_uid === ownerUid) : true;
+          log("visual job queued");
+          void runVisualEcho({
+            capsule, isDM, isOwner, channelId, channelType, apiUrl, botToken,
+          }).catch((e) => log("visual job failed:", e?.message || e));
+        }
       });
     } catch (e) {
       log("handleInbound 异常:", e);
@@ -487,4 +758,8 @@ async function main() {
   process.on("SIGTERM", () => { log("收到 SIGTERM，断开退出"); try { socket.disconnect(); } catch {} process.exit(0); });
 }
 
-main().catch((e) => { log("致命错误:", e); process.exit(1); });
+if (process.env.BRIDGE_NO_MAIN !== "1") {
+  main().catch((e) => { log("致命错误:", e); process.exit(1); });
+}
+
+export { parseMissionCapsule, redactSecrets, buildCapsuleSvg, renderPng, buildSummaryMd };
