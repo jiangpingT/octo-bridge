@@ -31,6 +31,7 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.CLAUDE_TIMEOUT_MS || 180000);
 // ---- 后端选择 ----
 //   claude（默认）— spawn 本机 claude CLI（cwd=Workspace，本体阿策）
 //   codex          — spawn 本机 codex CLI（cwd=CODEX_CWD，Codex harness 本体）
+//   hermes         — spawn 本机 hermes CLI（cwd=HERMES_CWD，Hermes Agent 本体阿爱）
 const AGENT_BACKEND = process.env.AGENT_BACKEND || "claude";
 
 // ---- Codex 后端配置（仅 AGENT_BACKEND=codex 时使用）----
@@ -45,6 +46,24 @@ const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || "").trim()
 // codex 会话映射文件：放在桥自己的目录里（已被 .gitignore 屏蔽，不入库）
 const BRIDGE_DIR = dirname(fileURLToPath(import.meta.url));
 const CODEX_SESSIONS_FILE = join(BRIDGE_DIR, ".codex-sessions.json");
+
+// ---- Hermes 后端配置（仅 AGENT_BACKEND=hermes 时使用）----
+const HERMES_BIN = process.env.HERMES_BIN || "/Users/mlamp/.local/bin/hermes";
+const HERMES_CWD = process.env.HERMES_CWD || "/Users/mlamp/Workspace/jphermes";
+const HERMES_MODEL = process.env.HERMES_MODEL || "";        // 空 = 用 hermes 默认模型
+const HERMES_TIMEOUT_MS = Number(process.env.HERMES_TIMEOUT_MS || 300000);
+// 完整权限（对等 jpcodex 的 danger）：--yolo 跳过危险命令审批 + --accept-hooks 自动批 shell hook
+const HERMES_FULL_ACCESS = process.env.HERMES_FULL_ACCESS === "1";
+
+// ---- Buddy 后端配置（仅 AGENT_BACKEND=buddy 时使用）----
+// codebuddy 是 Claude Code 的同构 fork：-p / --output-format / --permission-mode /
+// --session-id / --resume / --append-system-prompt / --model 全兼容，故复用 runClaude 模式。
+const BUDDY_BIN = process.env.BUDDY_BIN ||
+  "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy";
+const BUDDY_CWD = process.env.BUDDY_CWD || "/Users/mlamp/Workspace/jpbuddy";
+const BUDDY_PERMISSION_MODE = process.env.BUDDY_PERMISSION_MODE || "bypassPermissions";
+const BUDDY_MODEL = process.env.BUDDY_MODEL || "auto";   // 空 = 不传 --model
+const BUDDY_TIMEOUT_MS = Number(process.env.BUDDY_TIMEOUT_MS || 300000);
 
 const APPEND_SYSTEM_DM =
   "你正在通过 Octo IM 和姜哥私聊。直接用中文口语化回复，简洁，不要用 markdown 标题或大段列表。";
@@ -199,9 +218,68 @@ function runCodex(sessionKey, text, appendSystem) {
   })();
 }
 
+// ---- Hermes 后端 ----
+// hermes -z 是 headless 单次执行：只打印最终回复到 stdout，自动 bypass 审批，
+// 读 cwd 的 AGENTS.md / 记忆 / 工具。会话续接靠 --continue <稳定名>（不存在则自动建）。
+function runHermes(sessionKey, text, appendSystem) {
+  // hermes -z 没有 --append-system-prompt，把场景说明折叠进 prompt（同 codex）
+  const prompt = `${appendSystem}\n\n当前用户消息：\n${text}`;
+  const sessionName = `octo-${ACCOUNT_ID}-${sessionKey}`;
+  const modelArgs = HERMES_MODEL ? ["-m", HERMES_MODEL] : [];
+  const accessArgs = HERMES_FULL_ACCESS ? ["--yolo", "--accept-hooks"] : [];
+  return new Promise((resolve) => {
+    // --continue <name> 放在 -z 前；--continue 的可选参数 nargs='?' 会吃掉紧跟的非选项 token
+    const args = ["--continue", sessionName, ...accessArgs, ...modelArgs, "-z", prompt];
+    const child = spawn(HERMES_BIN, args, { cwd: HERMES_CWD, env: process.env });
+    let out = "", err = "";
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, HERMES_TIMEOUT_MS);
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, out: out.trim(), err: err.trim() }); });
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out: "", err: String(e) }); });
+  });
+}
+
+// ---- Buddy 后端（codebuddy，WorkBuddy 的内嵌 CLI，Claude Code 同构 fork）----
+function runBuddy(sessionKey, text, appendSystem) {
+  const sid = sessionUuid(sessionKey);
+  const modelArgs = BUDDY_MODEL ? ["--model", BUDDY_MODEL] : [];
+  const base = ["-p", "--output-format", "text", "--permission-mode", BUDDY_PERMISSION_MODE,
+    "--append-system-prompt", appendSystem, ...modelArgs];
+  const tryRun = (sessionArgs) =>
+    new Promise((resolve) => {
+      const args = [...base, ...sessionArgs, text];
+      const child = spawn(BUDDY_BIN, args, { cwd: BUDDY_CWD, env: process.env });
+      let out = "", err = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, BUDDY_TIMEOUT_MS);
+      child.stdout.on("data", (d) => (out += d));
+      child.stderr.on("data", (d) => (err += d));
+      child.on("close", (code) => { clearTimeout(timer); resolve({ code, out: out.trim(), err: err.trim() }); });
+      child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out: "", err: String(e) }); });
+    });
+
+  return (async () => {
+    // 续接优先（同 claude：--resume <id> / --session-id <id>，session 由确定性 UUID 持久化）
+    const r = await tryRun(["--resume", sid]);
+    if (r.code === 0 && r.out) return r;
+    const created = await tryRun(["--session-id", sid]);
+    if (created.code === 0 && created.out) return created;
+    if (/already in use/i.test(created.err || "")) {
+      const re = await tryRun(["--resume", sid]);
+      if (re.code === 0 && re.out) return re;
+    }
+    // codebuddy 偶发 429（版本限流弹窗，headless 下跳过致空输出）：续接重试一次兜底
+    const retry = await tryRun(["--resume", sid]);
+    if (retry.code === 0 && retry.out) return retry;
+    return created;
+  })();
+}
+
 // 统一入口：按 AGENT_BACKEND 分发
 function runAgent(sessionKey, text, appendSystem) {
   if (AGENT_BACKEND === "codex") return runCodex(sessionKey, text, appendSystem);
+  if (AGENT_BACKEND === "hermes") return runHermes(sessionKey, text, appendSystem);
+  if (AGENT_BACKEND === "buddy") return runBuddy(sessionKey, text, appendSystem);
   return runClaude(sessionKey, text, appendSystem);
 }
 
@@ -209,6 +287,10 @@ async function main() {
   const { botToken, apiUrl } = loadCreds();
   if (AGENT_BACKEND === "codex") {
     log(`瘦桥启动 backend=codex account=${ACCOUNT_ID} api=${apiUrl} codex_cwd=${CODEX_CWD} model=${CODEX_MODEL || "(default)"} danger=${CODEX_DANGER_FULL_ACCESS}`);
+  } else if (AGENT_BACKEND === "hermes") {
+    log(`瘦桥启动 backend=hermes account=${ACCOUNT_ID} api=${apiUrl} hermes_cwd=${HERMES_CWD} model=${HERMES_MODEL || "(default)"} full_access=${HERMES_FULL_ACCESS}`);
+  } else if (AGENT_BACKEND === "buddy") {
+    log(`瘦桥启动 backend=buddy account=${ACCOUNT_ID} api=${apiUrl} buddy_cwd=${BUDDY_CWD} model=${BUDDY_MODEL || "(default)"} perm=${BUDDY_PERMISSION_MODE}`);
   } else {
     log(`瘦桥启动 backend=claude account=${ACCOUNT_ID} api=${apiUrl} cwd=${WORKSPACE} perm=${PERMISSION_MODE}`);
   }

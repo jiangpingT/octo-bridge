@@ -1,9 +1,13 @@
-# octo-bridge —— 把 Claude Code 本体接入 Octo(悟空IM) 的瘦桥
+# octo-bridge —— 把本地 AI Agent 本体接入 Octo(悟空IM) 的瘦桥
 
 > 一份「怎么把一个本地 AI Agent 接进悟空IM(WukongIM)/Octo 私聊与群聊」的完整复盘。
 > 写给后来者(包括 AI)学习：不仅给出**最终代码**，更讲清**为什么这么做、踩过哪些坑、放弃了哪条路**。
 >
-> 记录时间：2026-06-07 ｜ 账号：`jpclaude`(`27xRn3zIJtU442712ef_bot`) ｜ 平台：macOS / Node 22
+> 首次记录：2026-06-07 ｜ 最近更新：2026-06-08 ｜ 平台：macOS / Node 22
+>
+> **现已支持四后端、四本体**：jpclaude(claude) / jpcodex(codex) / jphermes(hermes) / jpbuddy(codebuddy)，由 `AGENT_BACKEND` 切换、各一个 LaunchAgent 承载。更系统的「如何接真 Agent 到 Octo」总纲见 `如何接真Agent到Octo-复盘.md`。
+>
+> **⚠️ 重要更正(2026-06-08)**：本文 §2/§3/§10 早期写的「OpenClaw ACP 派发对 octo 私聊不生效/走不通」是**误判**，后被 jphermes 实证**证伪**——ACP 路线对 octo 私聊**可以**走通真本体，前提是配齐 acpx 别名 + `acp.allowedAgents` + `agents.list` 的 acp runtime + binding 四件。当年 jpclaude 没走通是**配置不全/未深究**，不是架构性不可行。瘦桥仍是有效且更可控的路径(也是本仓库选的路)，但**不是唯一路**。相关段落已就地标注更正。
 
 ---
 
@@ -30,9 +34,10 @@
   Octo/WukongIM → OpenClaw channel plugin → OpenClaw gateway
                 → 默认 agent "main" = openai/gpt-5.5 (codex 认证) → 模型答复
 
-【B. 我们一开始想走的 = OpenClaw ACP 派发到 Claude Code】(走不通)
+【B. 我们一开始想走的 = OpenClaw ACP 派发到 Claude Code】(当年没调通，后被证伪：其实能通)
   Octo/WukongIM → OpenClaw → [ACP 协议] → Claude Code 本体(跑在 Workspace)
-  ↑ 理论上最优雅，实际上 OpenClaw 对 octo 私聊的 ACP 派发不生效(见 §3)
+  ↑ 当年误以为「OpenClaw 对 octo 私聊的 ACP 派发不生效」(见 §3)；
+    2026-06-08 jphermes 实证：配齐四件即可走通真本体，是当年配置不全而非架构不可行。
 
 【C. 最终方案 = 自建瘦桥】(本仓库)
   Octo/WukongIM ──(复用 octo 扩展的 WKSocket 收 / REST 发)──► octo-bridge
@@ -44,15 +49,17 @@
 
 ---
 
-## 3. 关键决策：为什么放弃 OpenClaw 的 ACP 路由
+## 3. 关键决策：为什么本仓库选自建瘦桥(以及对 ACP 判断的更正)
 
-这是整件事最重要的判断。我们**先认真试了 B 方案**，从源码层面确认走不通后才转 C。诊断结论：
+> **⚠️ 更正(2026-06-08)**：下面这段当年的诊断结论——「OpenClaw ACP 派发对 octo 私聊架构性走不通」——**是错的**。2026-06-08 jphermes 在同一台机器上实证：只要配齐 ①`~/.acpx/config.json` 里该 agent 的 alias、②`acp.allowedAgents` 含该 agent、③`agents.list` 里该 agent 的 `runtime={type:"acp",...}`、④`bindings` 指向它，ACP **可以**走通 octo 私聊真本体。当年 jpclaude 没走通是**配置不全、未深究到底**，不是架构断层。保留原文供对照，但请以本更正为准。
 
-1. **octo 渠道的路由解析只认 `route` 绑定**。OpenClaw 里给账号配 `type:"acp"` 的 binding，不会被 octo 的 `resolveAgentRoute` 计入「路由覆盖」——`doctor` 直接把 jpclaude 标成 *uncovered*。
-2. 一个 agent 只有当**会话 key 是 ACP 形态**时才会以 ACP 方式跑；octo 私聊进来的会话 key 不是这个形态，于是**回退到默认 agent `main`**(= gpt-5.5)。这就是「jpclaude 用 codex 身份回话」的根因。
-3. ACP dispatch worker 需要设备 `operator.admin` scope；我们批了设备配对(`operator.pairing`)，但始终卡在 `scope upgrade pending approval` / `pairing-required`，拿不到 admin。
+本仓库最终选**自建瘦桥**，真正的理由不是「ACP 不可行」，而是**可控性**：每一行收发/断线/派发逻辑都在 `bridge.mjs` 一个文件里，排查只看一份日志，行为完全可预测。当年转向瘦桥时的(已被推翻的)诊断如下：
 
-**教训**：当一个「优雅的间接层」反复用配置怎么调都不通时，**去读它的路由源码**，确认是架构性断层而非配置错误；是架构问题就别硬刚，换一条自己完全掌控的短路径。我们因此转向「自建瘦桥」——代码可控、行为可预测、调试只看一份日志。
+1. ~~**octo 渠道的路由解析只认 `route` 绑定**。OpenClaw 里给账号配 `type:"acp"` 的 binding，不会被 octo 的 `resolveAgentRoute` 计入「路由覆盖」——`doctor` 直接把 jpclaude 标成 *uncovered*。~~（更正：配齐四件后可被正确解析）
+2. ~~一个 agent 只有当**会话 key 是 ACP 形态**时才会以 ACP 方式跑；octo 私聊进来的会话 key 不是这个形态，于是**回退到默认 agent `main`**(= gpt-5.5)。~~（更正：这是配置不全导致的回退，非必然）
+3. ~~ACP dispatch worker 需要设备 `operator.admin` scope；始终卡在 `scope upgrade pending approval`。~~（更正：当年环境问题，非架构性阻断）
+
+**真正的教训**(修订版)：①「优雅的间接层」久调不通时，先读它的路由源码，但**也要确认自己的配置是否真配齐了**——当年正是漏配导致误判成「架构不可行」。②即便 ACP 能通，若你要的是**最大可控性 + 单文件可排查**，自建瘦桥仍是更稳的选择。两条路都能接真本体，按可控性 vs 配置成本权衡。
 
 > 顺带说明：放弃 OpenClaw 的**ACP 派发**，不等于放弃 OpenClaw 这个**软件资产**。它的 octo 扩展里那套已经写好、能跑的悟空IM 加密协议栈，我们照单复用(见 §5)。绕开的是它的 agent 路由，不是它的协议实现。
 
@@ -234,7 +241,7 @@ launchctl print    gui/$U/com.jiang.octo-bridge | grep -E "state|pid ="
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `OCTO_ACCOUNT_ID` | `27xRn3zIJtU442712ef_bot` | 用哪个 octo bot 账号(对应配置里的 key) |
-| `AGENT_BACKEND` | `claude` | 后端选择：`claude`(默认) / `codex`(见 §13) |
+| `AGENT_BACKEND` | `claude` | 后端选择：`claude`(默认) / `codex` / `hermes` / `buddy`(=codebuddy)(见 §13) |
 | `CLAUDE_CWD` | `/Users/mlamp/Workspace` | claude 工作目录(决定它读哪个 CLAUDE.md/记忆/技能) |
 | `CLAUDE_BIN` | `/Users/mlamp/.local/bin/claude` | claude 可执行文件 |
 | `CLAUDE_PERMISSION_MODE` | `default` | `default`/`acceptEdits`/`bypassPermissions`/`plan` |
@@ -253,14 +260,14 @@ launchctl print    gui/$U/com.jiang.octo-bridge | grep -E "state|pid ="
 
 | 现象 | 根因 | 对策 |
 |------|------|------|
-| jpclaude 用 gpt-5.5/codex 身份回话 | OpenClaw octo 路由不认 acp 绑定，回退默认 agent | 放弃 ACP 派发，自建瘦桥(§3) |
+| jpclaude 用 gpt-5.5/codex 身份回话 | (当年判断)OpenClaw octo 路由不认 acp 绑定回退默认 agent；**更正**：实为 ACP 配置不全导致回退，非架构断层 | 本仓库选自建瘦桥(可控性最高，§3)；ACP 路线配齐四件后亦可走通 |
 | `Kicked by server` | 同一 uid 被两处同时连(OpenClaw 账号 + 瘦桥) | 启用瘦桥前先在 OpenClaw 里把该账号 `enabled:false`，释放 WS 独占 |
 | 偶发丢消息 | WS 每 15–18 分钟断一次，重连缝里的消息丢失且不自动补 | 重连后 `messages/sync` 补拉 + message_id 去重(§6.6) |
 | 启动偶尔崩 10 秒 | `registerBot` 撞网络抖动 `fetch failed` 抛出 | 启动退避重试 + KeepAlive(§6.7) |
 | 群里没反应 | 群消息默认只在被 @ 时响应；或非主人被门禁拦 | 确认 @ 了 bot；查 `GROUP_ACCESS` 与 `owner_uid` |
 | 群回复发错对象 | 把群的 channel_id 当私聊、或拆了 thread 的 channel_id | 严格按 §4.3 路由，channel_id 原样回 |
 
-**最大的一条元教训**：遇到「优雅中间层」久调不通，先花时间读它的源码判断是不是架构性断层；是，就果断换成自己完全掌控的短路径，而不是无限期和黑箱配置搏斗。
+**最大的一条元教训**(修订版)：遇到「优雅中间层」久调不通，先读它的源码判断是不是架构性断层——但**别急着下「架构不可行」的结论**，先确认自己的配置是否真配齐(当年正是漏配 acpx 别名/allowedAgents/acp runtime/binding 四件就误判成 ACP 走不通，后被 jphermes 证伪)。若确认能通但你要的是最大可控性，再换成自己完全掌控的短路径(瘦桥)。结论：**判断要留余地，区分「架构不可行」与「我没配对」。**
 
 ---
 
@@ -281,9 +288,11 @@ launchctl print    gui/$U/com.jiang.octo-bridge | grep -E "state|pid ="
 
 ---
 
-## 13. Codex Harness 后端(多后端支持)
+## 13. 多后端支持(claude / codex / hermes / buddy)
 
-瘦桥支持两种本体后端，由 `AGENT_BACKEND` 切换，默认 `claude`(对现有 jpclaude 零影响)。
+瘦桥支持四种本体后端，由 `AGENT_BACKEND` 切换，默认 `claude`(对现有 jpclaude 零影响)。
+
+> 本节详写 codex 后端(最早落地的第二后端)。hermes、buddy(codebuddy) 两个后端的调用方式、会话续接、权限标志、人格文件差异，见仓库根目录 **`如何接真Agent到Octo-复盘.md`** 的「四后端调用速查表」与「加一个新后端的 7 步法」。四后端速查：claude(`claude -p`,--resume,bypassPermissions,CLAUDE.md) / codex(`codex exec --json -o - `,resume id,danger,AGENTS.md) / hermes(`hermes -z`,--continue,--yolo --accept-hooks,AGENTS.md) / buddy(`codebuddy -p`,--resume,bypassPermissions,CODEBUDDY.md)。
 
 ### 13.1 机制
 - `runAgent()` 按 `AGENT_BACKEND` 分发到 `runClaude()` 或 `runCodex()`。
